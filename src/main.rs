@@ -6,20 +6,23 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use in-memory store for demo (replace with S3 for production)
-    let object_store: Arc<dyn ObjectStore + 'static> = Arc::new(InMemory::new());
+    // let object_store: Arc<dyn ObjectStore + 'static> = Arc::new(InMemory::new());
 
     // For S3, uncomment and configure:
-    // let object_store: Arc<dyn ObjectStore> = Arc::new(
-    //     object_store::aws::AmazonS3Builder::new()
-    //         .with_endpoint("http://localhost:4566") // LocalStack or real S3
-    //         .with_access_key_id("your-access-key")
-    //         .with_secret_access_key("your-secret-key")
-    //         .with_bucket_name("smolpuff-vectors")
-    //         .with_region("us-east-1")
-    //         .build()?,
-    // );
+    // localstack start
+    // awslocal s3 mb s3://smolpuff --region us-east-1
+    let object_store: Arc<dyn ObjectStore> = Arc::new(
+        object_store::aws::AmazonS3Builder::new()
+            .with_endpoint("http://localhost:4566") // LocalStack or real S3
+            .with_access_key_id("access_key_id")
+            .with_secret_access_key("secret_acess_key")
+            .with_allow_http(true)
+            .with_bucket_name("smolpuff")
+            .with_region("us-east-1")
+            .build()?,
+    );
 
-    let store = VectorStore::open("/smolpuff/vectors", object_store).await?;
+    let store = VectorStore::open("/vectors", object_store).await?;
 
     // Add some test vectors
     println!("Adding vectors...");
