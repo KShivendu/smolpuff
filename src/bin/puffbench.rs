@@ -82,7 +82,12 @@ async fn main() {
         }
     }
 
-    // Create namespace
+    // Clean up any leftover namespace from a previous run, then create fresh
+    client
+        .delete(format!("{base}/v1/namespaces/{ns}"))
+        .send()
+        .await
+        .ok();
     let resp = client
         .post(format!("{base}/v1/namespaces"))
         .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
