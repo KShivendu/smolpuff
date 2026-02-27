@@ -2345,6 +2345,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "dotenvy",
  "futures",
  "metrics",
  "metrics-exporter-prometheus",
