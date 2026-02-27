@@ -94,7 +94,12 @@ async fn main() {
         .unwrap();
     if resp.status() == 409 {
         eprint!("Cleaning up old namespace... ");
-        client
+        // Delete can be slow (scans all vectors), so use a longer timeout
+        let cleanup_client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        cleanup_client
             .delete(format!("{base}/v1/namespaces/{ns}"))
             .send()
             .await
