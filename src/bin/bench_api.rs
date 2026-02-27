@@ -99,7 +99,7 @@ impl std::fmt::Display for Stats {
     }
 }
 
-fn compute_stats(durations: &mut Vec<Duration>) -> Stats {
+fn compute_stats(durations: &mut [Duration]) -> Stats {
     durations.sort();
     let n = durations.len();
     let total: Duration = durations.iter().sum();
