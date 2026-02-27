@@ -220,7 +220,7 @@ async fn main() {
         }
         Err(e) => {
             eprintln!("Cannot reach server at {base}: {e}");
-            eprintln!("Usage: bench_api [BASE_URL]  (default: http://127.0.0.1:3000)");
+            eprintln!("Usage: puffbench [BASE_URL]  (default: http://127.0.0.1:3000)");
             std::process::exit(1);
         }
     }
