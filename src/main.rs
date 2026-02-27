@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     // Configure object store: try S3/LocalStack from env, fallback to InMemory
