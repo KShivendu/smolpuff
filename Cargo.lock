@@ -2345,6 +2345,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "futures",
  "metrics",
  "metrics-exporter-prometheus",
  "object_store",
