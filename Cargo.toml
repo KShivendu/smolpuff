@@ -2,6 +2,7 @@
 name = "smolpuff"
 version = "0.1.0"
 edition = "2024"
+default-run = "smolpuff"
 
 [dependencies]
 object_store = { version = "0.12.4", features = ["aws", "azure"] }
@@ -15,11 +16,17 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
-rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
 tokio-test = "0.4"
 
 [[bench]]
