@@ -1,4 +1,5 @@
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use rand::Rng;
 use reqwest::Client;
 use std::time::{Duration, Instant};
@@ -34,6 +35,10 @@ struct Args {
     /// Iterations per measurement point
     #[arg(long, default_value_t = 50)]
     iters: usize,
+
+    /// Number of concurrent requests
+    #[arg(long, default_value_t = 2)]
+    concurrency: usize,
 }
 
 fn generate_random_vector(dim: usize) -> Vec<f32> {
@@ -110,28 +115,41 @@ fn compute_stats(durations: &mut [Duration]) -> Stats {
     }
 }
 
-async fn bench_write_latency(client: &Client, base: &str, dims: &[usize], iters: usize) {
+async fn bench_write_latency(
+    client: &Client,
+    base: &str,
+    dims: &[usize],
+    iters: usize,
+    concurrency: usize,
+) {
     println!("\n=== Write Latency (per-upsert round-trip) ===");
 
     for &dim in dims {
         let ns = format!("bench_wl_{dim}");
         create_ns(client, base, &ns, dim).await;
 
-        let mut durations = Vec::with_capacity(iters);
-        for i in 0..iters {
-            let vector = generate_random_vector(dim);
-            let start = Instant::now();
-            client
-                .post(format!("{base}/v1/namespaces/{ns}/write"))
-                .json(&serde_json::json!({
-                    "id": format!("v{i}"),
-                    "vector": vector,
-                }))
-                .send()
-                .await
-                .unwrap();
-            durations.push(start.elapsed());
-        }
+        let mut durations: Vec<Duration> = stream::iter(0..iters)
+            .map(|i| {
+                let client = client.clone();
+                let url = format!("{base}/v1/namespaces/{ns}/write");
+                let vector = generate_random_vector(dim);
+                async move {
+                    let start = Instant::now();
+                    client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "id": format!("v{i}"),
+                            "vector": vector,
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    start.elapsed()
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
         let stats = compute_stats(&mut durations);
         println!("  dim={dim:<4}  {stats}");
@@ -139,7 +157,7 @@ async fn bench_write_latency(client: &Client, base: &str, dims: &[usize], iters:
     }
 }
 
-async fn bench_write_throughput(client: &Client, base: &str, counts: &[usize]) {
+async fn bench_write_throughput(client: &Client, base: &str, counts: &[usize], concurrency: usize) {
     println!("\n=== Write Throughput (bulk upsert) ===");
     let dim = 128;
 
@@ -148,18 +166,26 @@ async fn bench_write_throughput(client: &Client, base: &str, counts: &[usize]) {
         create_ns(client, base, &ns, dim).await;
 
         let start = Instant::now();
-        for i in 0..count {
-            let vector = generate_random_vector(dim);
-            client
-                .post(format!("{base}/v1/namespaces/{ns}/write"))
-                .json(&serde_json::json!({
-                    "id": format!("v{i}"),
-                    "vector": vector,
-                }))
-                .send()
-                .await
-                .unwrap();
-        }
+        stream::iter(0..count)
+            .map(|i| {
+                let client = client.clone();
+                let url = format!("{base}/v1/namespaces/{ns}/write");
+                let vector = generate_random_vector(dim);
+                async move {
+                    client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "id": format!("v{i}"),
+                            "vector": vector,
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<()>>()
+            .await;
         let elapsed = start.elapsed();
         let ops_sec = count as f64 / elapsed.as_secs_f64();
 
@@ -172,7 +198,13 @@ async fn bench_write_throughput(client: &Client, base: &str, counts: &[usize]) {
     }
 }
 
-async fn bench_query_latency(client: &Client, base: &str, store_sizes: &[usize], iters: usize) {
+async fn bench_query_latency(
+    client: &Client,
+    base: &str,
+    store_sizes: &[usize],
+    iters: usize,
+    concurrency: usize,
+) {
     println!("\n=== Query Latency (top_k=10) ===");
     let dim = 128;
     let top_k = 10;
@@ -181,21 +213,28 @@ async fn bench_query_latency(client: &Client, base: &str, store_sizes: &[usize],
         let ns = format!("bench_ql_{store_size}");
         populate(client, base, &ns, dim, store_size).await;
 
-        let mut durations = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let vector = generate_random_vector(dim);
-            let start = Instant::now();
-            client
-                .post(format!("{base}/v1/namespaces/{ns}/query"))
-                .json(&serde_json::json!({
-                    "vector": vector,
-                    "top_k": top_k,
-                }))
-                .send()
-                .await
-                .unwrap();
-            durations.push(start.elapsed());
-        }
+        let mut durations: Vec<Duration> = stream::iter(0..iters)
+            .map(|_| {
+                let client = client.clone();
+                let url = format!("{base}/v1/namespaces/{ns}/query");
+                let vector = generate_random_vector(dim);
+                async move {
+                    let start = Instant::now();
+                    client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "vector": vector,
+                            "top_k": top_k,
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    start.elapsed()
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
         let stats = compute_stats(&mut durations);
         println!("  n={store_size:<5}  {stats}");
@@ -203,7 +242,13 @@ async fn bench_query_latency(client: &Client, base: &str, store_sizes: &[usize],
     }
 }
 
-async fn bench_query_varying_k(client: &Client, base: &str, top_ks: &[usize], iters: usize) {
+async fn bench_query_varying_k(
+    client: &Client,
+    base: &str,
+    top_ks: &[usize],
+    iters: usize,
+    concurrency: usize,
+) {
     println!("\n=== Query Varying top_k (store_size=500) ===");
     let dim = 128;
     let store_size = 500;
@@ -212,21 +257,28 @@ async fn bench_query_varying_k(client: &Client, base: &str, top_ks: &[usize], it
     populate(client, base, ns, dim, store_size).await;
 
     for &top_k in top_ks {
-        let mut durations = Vec::with_capacity(iters);
-        for _ in 0..iters {
-            let vector = generate_random_vector(dim);
-            let start = Instant::now();
-            client
-                .post(format!("{base}/v1/namespaces/{ns}/query"))
-                .json(&serde_json::json!({
-                    "vector": vector,
-                    "top_k": top_k,
-                }))
-                .send()
-                .await
-                .unwrap();
-            durations.push(start.elapsed());
-        }
+        let mut durations: Vec<Duration> = stream::iter(0..iters)
+            .map(|_| {
+                let client = client.clone();
+                let url = format!("{base}/v1/namespaces/{ns}/query");
+                let vector = generate_random_vector(dim);
+                async move {
+                    let start = Instant::now();
+                    client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "vector": vector,
+                            "top_k": top_k,
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    start.elapsed()
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
         let stats = compute_stats(&mut durations);
         println!("  top_k={top_k:<3}  {stats}");
@@ -254,21 +306,22 @@ async fn main() {
     }
 
     let run_all = args.workload.iter().any(|w| w == "all");
+    let concurrency = args.concurrency;
 
     println!("smolpuff API benchmark");
-    println!("Target: {base}");
+    println!("Target: {base}  Concurrency: {concurrency}");
 
     if run_all || args.workload.iter().any(|w| w == "write-latency") {
-        bench_write_latency(&client, base, &args.dims, args.iters).await;
+        bench_write_latency(&client, base, &args.dims, args.iters, concurrency).await;
     }
     if run_all || args.workload.iter().any(|w| w == "write-throughput") {
-        bench_write_throughput(&client, base, &args.counts).await;
+        bench_write_throughput(&client, base, &args.counts, concurrency).await;
     }
     if run_all || args.workload.iter().any(|w| w == "query-latency") {
-        bench_query_latency(&client, base, &args.store_sizes, args.iters).await;
+        bench_query_latency(&client, base, &args.store_sizes, args.iters, concurrency).await;
     }
     if run_all || args.workload.iter().any(|w| w == "query-topk") {
-        bench_query_varying_k(&client, base, &args.top_ks, args.iters).await;
+        bench_query_varying_k(&client, base, &args.top_ks, args.iters, concurrency).await;
     }
 
     println!("\nDone.");

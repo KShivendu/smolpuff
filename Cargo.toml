@@ -19,6 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+futures = "0.3"
 
 [dependencies.rand]
 version = "0.8"
