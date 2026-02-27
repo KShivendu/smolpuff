@@ -3,7 +3,9 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::signal;
 
 #[derive(Parser)]
 #[command(name = "puffbench", about = "smolpuff benchmark")]
@@ -66,6 +68,12 @@ impl std::fmt::Display for Stats {
     }
 }
 
+fn generate_run_id() -> String {
+    let mut rng = rand::thread_rng();
+    let id: u32 = rng.gen_range(0..0xFFFFFF);
+    format!("{id:06x}")
+}
+
 async fn annotate(client: &Client, grafana_url: &str, text: &str, tags: &[&str]) {
     let _ = client
         .post(format!("{grafana_url}/api/annotations"))
@@ -92,6 +100,7 @@ async fn main() {
     let args = Args::parse();
     let base = &args.url;
     let ns = &args.namespace;
+    let run_id = generate_run_id();
 
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
@@ -109,20 +118,39 @@ async fn main() {
         }
     }
 
+    // Set up Ctrl+C handler to annotate abort in Grafana
+    let abort_client = client.clone();
+    let abort_grafana = args.grafana_url.clone();
+    let abort_run_id = run_id.clone();
+    let abort_run_id = Arc::new(abort_run_id);
+    let abort_run_id_clone = abort_run_id.clone();
+    tokio::spawn(async move {
+        signal::ctrl_c().await.ok();
+        annotate(
+            &abort_client,
+            &abort_grafana,
+            &format!("[{abort_run_id_clone}] Benchmark ABORTED"),
+            &["puffbench", "abort"],
+        )
+        .await;
+        std::process::exit(130);
+    });
+
     // Annotate benchmark start in Grafana
     let grafana = &args.grafana_url;
     let start_text = if args.query_only {
         format!(
-            "Benchmark started: query-only, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            "[{run_id}] Benchmark started: query-only, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
             args.queries, args.dim, args.top_k, args.concurrency
         )
     } else {
         format!(
-            "Benchmark started: {} vectors, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            "[{run_id}] Benchmark started: {} vectors, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
             args.vectors, args.queries, args.dim, args.top_k, args.concurrency
         )
     };
     annotate(&client, grafana, &start_text, &["puffbench", "start"]).await;
+    eprintln!("Run ID: {run_id}");
 
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
         .unwrap()
@@ -258,9 +286,9 @@ async fn main() {
 
     // Annotate benchmark end in Grafana
     let end_text = if let Some(ws) = &write_stats {
-        format!("Benchmark finished — Write: {ws} | Query: {query_stats}")
+        format!("[{run_id}] Benchmark finished — Write: {ws} | Query: {query_stats}")
     } else {
-        format!("Benchmark finished — Query: {query_stats}")
+        format!("[{run_id}] Benchmark finished — Query: {query_stats}")
     };
     annotate(&client, grafana, &end_text, &["puffbench", "end"]).await;
 
