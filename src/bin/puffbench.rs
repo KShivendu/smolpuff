@@ -21,7 +21,7 @@ struct Args {
     dims: Vec<usize>,
 
     /// Write counts for write-throughput
-    #[arg(long = "count", value_delimiter = ',', default_values_t = vec![100, 500, 1000])]
+    #[arg(long = "count", value_delimiter = ',', default_values_t = vec![500, 2000, 5000])]
     counts: Vec<usize>,
 
     /// Store sizes for query-latency
@@ -37,7 +37,7 @@ struct Args {
     iters: usize,
 
     /// Number of concurrent requests
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 16)]
     concurrency: usize,
 }
 
@@ -64,20 +64,35 @@ async fn delete_ns(client: &Client, base: &str, ns: &str) {
         .unwrap();
 }
 
-async fn populate(client: &Client, base: &str, ns: &str, dim: usize, count: usize) {
+async fn populate(
+    client: &Client,
+    base: &str,
+    ns: &str,
+    dim: usize,
+    count: usize,
+    concurrency: usize,
+) {
     create_ns(client, base, ns, dim).await;
-    for i in 0..count {
-        let vector = generate_random_vector(dim);
-        client
-            .post(format!("{base}/v1/namespaces/{ns}/write"))
-            .json(&serde_json::json!({
-                "id": format!("v{i}"),
-                "vector": vector,
-            }))
-            .send()
-            .await
-            .unwrap();
-    }
+    stream::iter(0..count)
+        .map(|i| {
+            let client = client.clone();
+            let url = format!("{base}/v1/namespaces/{ns}/write");
+            let vector = generate_random_vector(dim);
+            async move {
+                client
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "id": format!("v{i}"),
+                        "vector": vector,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<()>>()
+        .await;
 }
 
 struct Stats {
@@ -211,7 +226,7 @@ async fn bench_query_latency(
 
     for &store_size in store_sizes {
         let ns = format!("bench_ql_{store_size}");
-        populate(client, base, &ns, dim, store_size).await;
+        populate(client, base, &ns, dim, store_size, concurrency).await;
 
         let mut durations: Vec<Duration> = stream::iter(0..iters)
             .map(|_| {
@@ -254,7 +269,7 @@ async fn bench_query_varying_k(
     let store_size = 500;
 
     let ns = "bench_qk";
-    populate(client, base, ns, dim, store_size).await;
+    populate(client, base, ns, dim, store_size, concurrency).await;
 
     for &top_k in top_ks {
         let mut durations: Vec<Duration> = stream::iter(0..iters)
