@@ -85,21 +85,35 @@ async fn main() {
         }
     }
 
-    // Clean up any leftover namespace from a previous run, then create fresh
-    eprint!("Cleaning up old namespace... ");
-    client
-        .delete(format!("{base}/v1/namespaces/{ns}"))
-        .send()
-        .await
-        .ok();
-    eprintln!("done");
+    // Create namespace, cleaning up any leftover from a previous run
     let resp = client
         .post(format!("{base}/v1/namespaces"))
         .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "Failed to create namespace");
+    if resp.status() == 409 {
+        eprint!("Cleaning up old namespace... ");
+        client
+            .delete(format!("{base}/v1/namespaces/{ns}"))
+            .send()
+            .await
+            .unwrap();
+        eprintln!("done");
+        let resp = client
+            .post(format!("{base}/v1/namespaces"))
+            .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "Failed to create namespace after cleanup"
+        );
+    } else {
+        assert_eq!(resp.status(), 200, "Failed to create namespace");
+    }
 
     let style = ProgressStyle::with_template(
         "{prefix:>10} [{bar:30}] {pos}/{len} ({per_sec}, eta {eta}) {msg}",
