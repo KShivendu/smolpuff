@@ -1,12 +1,12 @@
-use object_store::memory::InMemory;
 use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use reqwest::Client;
-use smolpuff::handlers;
 use smolpuff::VectorStore;
+use smolpuff::handlers;
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
 use axum::Router;
+use axum::routing::{delete, get, post};
 
 async fn spawn_server() -> String {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use object_store::memory::InMemory;
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use rand::Rng;
 use smolpuff::VectorStore;
 use std::sync::Arc;
