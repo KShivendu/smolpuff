@@ -1,6 +1,40 @@
+use clap::Parser;
 use rand::Rng;
 use reqwest::Client;
 use std::time::{Duration, Instant};
+
+#[derive(Parser)]
+#[command(name = "puffbench", about = "smolpuff API benchmark")]
+struct Args {
+    /// Server URL
+    #[arg(long, default_value = "http://127.0.0.1:3000")]
+    url: String,
+
+    /// Workloads to run (comma-separated)
+    /// Values: write-latency, write-throughput, query-latency, query-topk, all
+    #[arg(long, value_delimiter = ',', default_value = "all")]
+    workload: Vec<String>,
+
+    /// Vector dimensions for write-latency
+    #[arg(long = "dim", value_delimiter = ',', default_values_t = vec![64, 128, 256, 512])]
+    dims: Vec<usize>,
+
+    /// Write counts for write-throughput
+    #[arg(long = "count", value_delimiter = ',', default_values_t = vec![100, 500, 1000])]
+    counts: Vec<usize>,
+
+    /// Store sizes for query-latency
+    #[arg(long = "store-size", value_delimiter = ',', default_values_t = vec![100, 500, 1000])]
+    store_sizes: Vec<usize>,
+
+    /// Top-k values for query-topk
+    #[arg(long = "top-k", value_delimiter = ',', default_values_t = vec![1, 5, 10, 50])]
+    top_ks: Vec<usize>,
+
+    /// Iterations per measurement point
+    #[arg(long, default_value_t = 50)]
+    iters: usize,
+}
 
 fn generate_random_vector(dim: usize) -> Vec<f32> {
     let mut rng = rand::thread_rng();
@@ -76,16 +110,15 @@ fn compute_stats(durations: &mut [Duration]) -> Stats {
     }
 }
 
-async fn bench_write_latency(client: &Client, base: &str) {
+async fn bench_write_latency(client: &Client, base: &str, dims: &[usize], iters: usize) {
     println!("\n=== Write Latency (per-upsert round-trip) ===");
-    let writes_per_dim = 50;
 
-    for &dim in &[64, 128, 256, 512] {
+    for &dim in dims {
         let ns = format!("bench_wl_{dim}");
         create_ns(client, base, &ns, dim).await;
 
-        let mut durations = Vec::with_capacity(writes_per_dim);
-        for i in 0..writes_per_dim {
+        let mut durations = Vec::with_capacity(iters);
+        for i in 0..iters {
             let vector = generate_random_vector(dim);
             let start = Instant::now();
             client
@@ -106,11 +139,11 @@ async fn bench_write_latency(client: &Client, base: &str) {
     }
 }
 
-async fn bench_write_throughput(client: &Client, base: &str) {
+async fn bench_write_throughput(client: &Client, base: &str, counts: &[usize]) {
     println!("\n=== Write Throughput (bulk upsert) ===");
     let dim = 128;
 
-    for &count in &[100, 500, 1000] {
+    for &count in counts {
         let ns = format!("bench_wt_{count}");
         create_ns(client, base, &ns, dim).await;
 
@@ -139,18 +172,17 @@ async fn bench_write_throughput(client: &Client, base: &str) {
     }
 }
 
-async fn bench_query_latency(client: &Client, base: &str) {
+async fn bench_query_latency(client: &Client, base: &str, store_sizes: &[usize], iters: usize) {
     println!("\n=== Query Latency (top_k=10) ===");
     let dim = 128;
     let top_k = 10;
-    let queries = 50;
 
-    for &store_size in &[100, 500, 1000] {
+    for &store_size in store_sizes {
         let ns = format!("bench_ql_{store_size}");
         populate(client, base, &ns, dim, store_size).await;
 
-        let mut durations = Vec::with_capacity(queries);
-        for _ in 0..queries {
+        let mut durations = Vec::with_capacity(iters);
+        for _ in 0..iters {
             let vector = generate_random_vector(dim);
             let start = Instant::now();
             client
@@ -171,18 +203,17 @@ async fn bench_query_latency(client: &Client, base: &str) {
     }
 }
 
-async fn bench_query_varying_k(client: &Client, base: &str) {
+async fn bench_query_varying_k(client: &Client, base: &str, top_ks: &[usize], iters: usize) {
     println!("\n=== Query Varying top_k (store_size=500) ===");
     let dim = 128;
     let store_size = 500;
-    let queries = 50;
 
     let ns = "bench_qk";
     populate(client, base, ns, dim, store_size).await;
 
-    for &top_k in &[1, 5, 10, 50] {
-        let mut durations = Vec::with_capacity(queries);
-        for _ in 0..queries {
+    for &top_k in top_ks {
+        let mut durations = Vec::with_capacity(iters);
+        for _ in 0..iters {
             let vector = generate_random_vector(dim);
             let start = Instant::now();
             client
@@ -206,11 +237,9 @@ async fn bench_query_varying_k(client: &Client, base: &str) {
 
 #[tokio::main]
 async fn main() {
-    let base = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+    let args = Args::parse();
+    let base = &args.url;
 
-    // Verify server is reachable
     let client = Client::new();
     match client.get(format!("{base}/")).send().await {
         Ok(resp) if resp.status().is_success() => {}
@@ -220,18 +249,27 @@ async fn main() {
         }
         Err(e) => {
             eprintln!("Cannot reach server at {base}: {e}");
-            eprintln!("Usage: puffbench [BASE_URL]  (default: http://127.0.0.1:3000)");
             std::process::exit(1);
         }
     }
 
+    let run_all = args.workload.iter().any(|w| w == "all");
+
     println!("smolpuff API benchmark");
     println!("Target: {base}");
 
-    bench_write_latency(&client, &base).await;
-    bench_write_throughput(&client, &base).await;
-    bench_query_latency(&client, &base).await;
-    bench_query_varying_k(&client, &base).await;
+    if run_all || args.workload.iter().any(|w| w == "write-latency") {
+        bench_write_latency(&client, base, &args.dims, args.iters).await;
+    }
+    if run_all || args.workload.iter().any(|w| w == "write-throughput") {
+        bench_write_throughput(&client, base, &args.counts).await;
+    }
+    if run_all || args.workload.iter().any(|w| w == "query-latency") {
+        bench_query_latency(&client, base, &args.store_sizes, args.iters).await;
+    }
+    if run_all || args.workload.iter().any(|w| w == "query-topk") {
+        bench_query_varying_k(&client, base, &args.top_ks, args.iters).await;
+    }
 
     println!("\nDone.");
 }
