@@ -125,10 +125,10 @@ async fn main() {
     }
 
     let style = ProgressStyle::with_template(
-        "{prefix:>10} {bar:40.cyan/dim} {pos:>6}/{len} | {per_sec:>12} | eta {eta:>3} {msg}",
+        "{prefix:>10.bold} {bar:40.green/black} {pos:>6}/{len} | {per_sec:>12.cyan} | eta {eta:>3.yellow} {msg:.green.bold}",
     )
     .unwrap()
-    .progress_chars("##-");
+    .progress_chars("\u{2588}\u{2592}\u{2591}");
 
     // Write phase
     let pb = ProgressBar::new(args.vectors as u64)
