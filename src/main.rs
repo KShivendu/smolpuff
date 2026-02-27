@@ -1,8 +1,11 @@
 use axum::Router;
+use axum::middleware;
 use axum::routing::{delete, get, post};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use object_store::ObjectStore;
 use smolpuff::VectorStore;
 use smolpuff::handlers;
+use smolpuff::metrics::track_metrics;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
@@ -36,16 +39,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
     let store = VectorStore::open("/smolpuff", object_store).await?;
     let store = Arc::new(store);
 
     let app = Router::new()
         .route("/", get(handlers::root))
+        .route(
+            "/metrics",
+            get(move || async move { prometheus_handle.render() }),
+        )
         .route("/v1/namespaces", post(handlers::create_namespace))
         .route("/v1/namespaces/{ns}", get(handlers::get_namespace))
         .route("/v1/namespaces/{ns}", delete(handlers::delete_namespace))
         .route("/v1/namespaces/{ns}/write", post(handlers::write))
         .route("/v1/namespaces/{ns}/query", post(handlers::query))
+        .layer(middleware::from_fn(track_metrics))
         .layer(TraceLayer::new_for_http())
         .with_state(store);
 
