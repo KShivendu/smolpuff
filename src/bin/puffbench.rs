@@ -150,7 +150,17 @@ async fn main() {
         )
     };
     annotate(&client, grafana, &start_text, &["puffbench", "start"]).await;
-    eprintln!("Run ID: {run_id}");
+    if args.query_only {
+        eprintln!(
+            "[{run_id}] query-only: {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.queries, args.dim, args.top_k, args.concurrency
+        );
+    } else {
+        eprintln!(
+            "[{run_id}] {} vectors, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.vectors, args.queries, args.dim, args.top_k, args.concurrency
+        );
+    }
 
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
         .unwrap()
