@@ -1,42 +1,6 @@
-use object_store::ObjectStore;
-use object_store::memory::InMemory;
 use rand::Rng;
 use reqwest::Client;
-use smolpuff::VectorStore;
-use smolpuff::handlers;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use axum::Router;
-use axum::routing::{delete, get, post};
-
-async fn spawn_server() -> String {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let store = VectorStore::open("/bench", object_store)
-        .await
-        .expect("Failed to open store");
-    let store = Arc::new(store);
-
-    let app = Router::new()
-        .route("/v1/namespaces", post(handlers::create_namespace))
-        .route("/v1/namespaces/{ns}", get(handlers::get_namespace))
-        .route("/v1/namespaces/{ns}", delete(handlers::delete_namespace))
-        .route("/v1/namespaces/{ns}/write", post(handlers::write))
-        .route("/v1/namespaces/{ns}/query", post(handlers::query))
-        .with_state(store);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    base_url
-}
 
 fn generate_random_vector(dim: usize) -> Vec<f32> {
     let mut rng = rand::thread_rng();
@@ -242,11 +206,27 @@ async fn bench_query_varying_k(client: &Client, base: &str) {
 
 #[tokio::main]
 async fn main() {
-    let base = spawn_server().await;
+    let base = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+
+    // Verify server is reachable
     let client = Client::new();
+    match client.get(format!("{base}/")).send().await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            eprintln!("Server at {base} returned status {}", resp.status());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Cannot reach server at {base}: {e}");
+            eprintln!("Usage: bench_api [BASE_URL]  (default: http://127.0.0.1:3000)");
+            std::process::exit(1);
+        }
+    }
 
     println!("smolpuff API benchmark");
-    println!("Server running at {base}");
+    println!("Target: {base}");
 
     bench_write_latency(&client, &base).await;
     bench_write_throughput(&client, &base).await;
