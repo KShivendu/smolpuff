@@ -26,24 +26,16 @@ pub enum VectorStoreError {
 impl IntoResponse for VectorStoreError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            VectorStoreError::DbError(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-            }
+            VectorStoreError::DbError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             VectorStoreError::SerializationError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }
-            VectorStoreError::NamespaceNotFound(_) => {
-                (StatusCode::NOT_FOUND, self.to_string())
-            }
-            VectorStoreError::NamespaceAlreadyExists(_) => {
-                (StatusCode::CONFLICT, self.to_string())
-            }
+            VectorStoreError::NamespaceNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            VectorStoreError::NamespaceAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             VectorStoreError::DimensionMismatch { .. } => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
-            VectorStoreError::InvalidRequest(_) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            VectorStoreError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
         };
 
         (status, axum::Json(serde_json::json!({ "error": message }))).into_response()

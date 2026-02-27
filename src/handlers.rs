@@ -1,5 +1,5 @@
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use std::sync::Arc;
 
 use crate::errors::VectorStoreError;
@@ -44,7 +44,9 @@ pub async fn write(
     Path(ns): Path<String>,
     Json(req): Json<WriteRequest>,
 ) -> Result<Json<WriteResponse>, VectorStoreError> {
-    store.upsert(&ns, &req.id, req.vector, req.attributes).await?;
+    store
+        .upsert(&ns, &req.id, req.vector, req.attributes)
+        .await?;
     Ok(Json(WriteResponse {
         id: req.id,
         status: "ok".to_string(),

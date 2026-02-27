@@ -75,10 +75,7 @@ impl VectorStore {
         Ok(metadata)
     }
 
-    pub async fn get_namespace(
-        &self,
-        name: &str,
-    ) -> Result<NamespaceMetadata, VectorStoreError> {
+    pub async fn get_namespace(&self, name: &str) -> Result<NamespaceMetadata, VectorStoreError> {
         let meta_key = format!("ns:{name}:meta");
 
         match self.db.get(meta_key.as_bytes()).await? {
@@ -98,7 +95,10 @@ impl VectorStore {
         // Delete all vec keys for this namespace
         let vec_prefix = format!("ns:{name}:vec:");
         let vec_end = format!("ns:{name}:vec;");
-        let mut iter = self.db.scan(vec_prefix.as_bytes()..vec_end.as_bytes()).await?;
+        let mut iter = self
+            .db
+            .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
+            .await?;
         while let Ok(Some(item)) = iter.next().await {
             self.db.delete(&item.key).await?;
         }
@@ -106,7 +106,10 @@ impl VectorStore {
         // Delete all doc keys for this namespace
         let doc_prefix = format!("ns:{name}:doc:");
         let doc_end = format!("ns:{name}:doc;");
-        let mut iter = self.db.scan(doc_prefix.as_bytes()..doc_end.as_bytes()).await?;
+        let mut iter = self
+            .db
+            .scan(doc_prefix.as_bytes()..doc_end.as_bytes())
+            .await?;
         while let Ok(Some(item)) = iter.next().await {
             self.db.delete(&item.key).await?;
         }
@@ -181,15 +184,15 @@ impl VectorStore {
         // Scan all vectors in this namespace
         let vec_prefix = format!("ns:{ns}:vec:");
         let vec_end = format!("ns:{ns}:vec;");
-        let mut iter = self.db.scan(vec_prefix.as_bytes()..vec_end.as_bytes()).await?;
+        let mut iter = self
+            .db
+            .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
+            .await?;
 
         while let Ok(Some(item)) = iter.next().await {
             // Extract id from key: "ns:{ns}:vec:{id}"
             let key_str = String::from_utf8_lossy(&item.key);
-            let id = key_str
-                .strip_prefix(&vec_prefix)
-                .unwrap_or("")
-                .to_string();
+            let id = key_str.strip_prefix(&vec_prefix).unwrap_or("").to_string();
 
             // Decode vector from le_bytes
             let vec_data = decode_f32_vec(&item.value);
@@ -199,11 +202,11 @@ impl VectorStore {
 
             if heap.len() < top_k {
                 heap.push(scored);
-            } else if let Some(min_item) = heap.peek() {
-                if score > min_item.score {
-                    heap.pop();
-                    heap.push(scored);
-                }
+            } else if let Some(min_item) = heap.peek()
+                && score > min_item.score
+            {
+                heap.pop();
+                heap.push(scored);
             }
         }
 

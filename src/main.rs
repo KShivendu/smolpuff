@@ -1,8 +1,8 @@
-use axum::routing::{delete, get, post};
 use axum::Router;
+use axum::routing::{delete, get, post};
 use object_store::ObjectStore;
-use smolpuff::handlers;
 use smolpuff::VectorStore;
+use smolpuff::handlers;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
@@ -17,8 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 object_store::aws::AmazonS3Builder::new()
                     .with_endpoint(&endpoint)
                     .with_access_key_id(
-                        std::env::var("AWS_ACCESS_KEY_ID")
-                            .unwrap_or_else(|_| "test".to_string()),
+                        std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "test".to_string()),
                     )
                     .with_secret_access_key(
                         std::env::var("AWS_SECRET_ACCESS_KEY")
@@ -27,8 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_allow_http(true)
                     .with_bucket_name(&bucket)
                     .with_region(
-                        std::env::var("AWS_REGION")
-                            .unwrap_or_else(|_| "us-east-1".to_string()),
+                        std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
                     )
                     .build()?,
             ),
