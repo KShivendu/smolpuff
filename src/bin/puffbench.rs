@@ -69,7 +69,10 @@ async fn main() {
     let base = &args.url;
     let ns = "bench";
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
     match client.get(format!("{base}/")).send().await {
         Ok(resp) if resp.status().is_success() => {}
         Ok(resp) => {
@@ -83,11 +86,13 @@ async fn main() {
     }
 
     // Clean up any leftover namespace from a previous run, then create fresh
+    eprint!("Cleaning up old namespace... ");
     client
         .delete(format!("{base}/v1/namespaces/{ns}"))
         .send()
         .await
         .ok();
+    eprintln!("done");
     let resp = client
         .post(format!("{base}/v1/namespaces"))
         .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
