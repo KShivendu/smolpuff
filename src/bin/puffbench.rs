@@ -96,14 +96,17 @@ async fn main() {
         .unwrap();
     assert_eq!(resp.status(), 200, "Failed to create namespace");
 
-    let style = ProgressStyle::with_template("{prefix} [{bar:30}] {pos}/{len} ({per_sec})")
-        .unwrap()
-        .progress_chars("=> ");
+    let style = ProgressStyle::with_template(
+        "{prefix:>10} [{bar:30}] {pos}/{len} ({per_sec}, eta {eta}) {msg}",
+    )
+    .unwrap()
+    .progress_chars("=> ");
 
     // Write phase
     let pb = ProgressBar::new(args.vectors as u64)
         .with_prefix("Writing")
         .with_style(style.clone());
+    pb.enable_steady_tick(Duration::from_millis(100));
     let mut write_durations: Vec<Duration> = stream::iter(0..args.vectors)
         .map(|i| {
             let client = client.clone();
@@ -128,14 +131,14 @@ async fn main() {
         .buffer_unordered(args.concurrency)
         .collect()
         .await;
-    pb.finish();
-
     let write_stats = compute_stats(&mut write_durations);
+    pb.finish_with_message(format!("done ({write_stats})"));
 
     // Query phase
     let pb = ProgressBar::new(args.queries as u64)
         .with_prefix("Querying")
         .with_style(style);
+    pb.enable_steady_tick(Duration::from_millis(100));
     let mut query_durations: Vec<Duration> = stream::iter(0..args.queries)
         .map(|_| {
             let client = client.clone();
@@ -161,9 +164,8 @@ async fn main() {
         .buffer_unordered(args.concurrency)
         .collect()
         .await;
-    pb.finish();
-
     let query_stats = compute_stats(&mut query_durations);
+    pb.finish_with_message(format!("done ({query_stats})"));
 
     // Delete namespace
     client
