@@ -1,97 +1,59 @@
-use object_store::memory::InMemory;
+use axum::routing::{delete, get, post};
+use axum::Router;
 use object_store::ObjectStore;
+use smolpuff::handlers;
 use smolpuff::VectorStore;
 use std::sync::Arc;
+use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Use in-memory store for demo (replace with S3 for production)
-    // let object_store: Arc<dyn ObjectStore + 'static> = Arc::new(InMemory::new());
+    tracing_subscriber::fmt::init();
 
-    // For S3, uncomment and configure:
-    // localstack start
-    // awslocal s3 mb s3://smolpuff --region us-east-1
-    let object_store: Arc<dyn ObjectStore> = Arc::new(
-        object_store::aws::AmazonS3Builder::new()
-            .with_endpoint("http://localhost:4566") // LocalStack or real S3
-            .with_access_key_id("access_key_id")
-            .with_secret_access_key("secret_acess_key")
-            .with_allow_http(true)
-            .with_bucket_name("smolpuff")
-            .with_region("us-east-1")
-            .build()?,
-    );
+    // Configure object store: try S3/LocalStack from env, fallback to InMemory
+    let object_store: Arc<dyn ObjectStore> =
+        match (std::env::var("AWS_ENDPOINT"), std::env::var("S3_BUCKET")) {
+            (Ok(endpoint), Ok(bucket)) => Arc::new(
+                object_store::aws::AmazonS3Builder::new()
+                    .with_endpoint(&endpoint)
+                    .with_access_key_id(
+                        std::env::var("AWS_ACCESS_KEY_ID")
+                            .unwrap_or_else(|_| "test".to_string()),
+                    )
+                    .with_secret_access_key(
+                        std::env::var("AWS_SECRET_ACCESS_KEY")
+                            .unwrap_or_else(|_| "test".to_string()),
+                    )
+                    .with_allow_http(true)
+                    .with_bucket_name(&bucket)
+                    .with_region(
+                        std::env::var("AWS_REGION")
+                            .unwrap_or_else(|_| "us-east-1".to_string()),
+                    )
+                    .build()?,
+            ),
+            _ => {
+                tracing::info!("No S3 config found, using in-memory object store");
+                Arc::new(object_store::memory::InMemory::new())
+            }
+        };
 
-    let store = VectorStore::open("/vectors", object_store).await?;
+    let store = VectorStore::open("/smolpuff", object_store).await?;
+    let store = Arc::new(store);
 
-    // Add some test vectors
-    println!("Adding vectors...");
+    let app = Router::new()
+        .route("/", get(handlers::root))
+        .route("/v1/namespaces", post(handlers::create_namespace))
+        .route("/v1/namespaces/{ns}", get(handlers::get_namespace))
+        .route("/v1/namespaces/{ns}", delete(handlers::delete_namespace))
+        .route("/v1/namespaces/{ns}/write", post(handlers::write))
+        .route("/v1/namespaces/{ns}/query", post(handlers::query))
+        .layer(TraceLayer::new_for_http())
+        .with_state(store);
 
-    store
-        .add(
-            "doc1",
-            vec![1.0, 0.0, 0.0],
-            Some(serde_json::json!({"title": "Document 1", "category": "A"})),
-        )
-        .await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    tracing::info!("Listening on {}", listener.local_addr()?);
+    axum::serve(listener, app).await?;
 
-    store
-        .add(
-            "doc2",
-            vec![0.9, 0.1, 0.0],
-            Some(serde_json::json!({"title": "Document 2", "category": "A"})),
-        )
-        .await?;
-
-    store
-        .add(
-            "doc3",
-            vec![0.0, 1.0, 0.0],
-            Some(serde_json::json!({"title": "Document 3", "category": "B"})),
-        )
-        .await?;
-
-    store
-        .add(
-            "doc4",
-            vec![0.0, 0.0, 1.0],
-            Some(serde_json::json!({"title": "Document 4", "category": "C"})),
-        )
-        .await?;
-
-    store.add("doc5", vec![0.5, 0.5, 0.0], None).await?;
-
-    // Query for similar vectors
-    println!("\nQuerying for vectors similar to [1.0, 0.0, 0.0]...");
-    let results = store.query(&[1.0, 0.0, 0.0], 3).await?;
-
-    for result in &results {
-        println!(
-            "  ID: {}, Score: {:.4}, Metadata: {:?}",
-            result.id, result.score, result.metadata
-        );
-    }
-
-    println!("\nQuerying for vectors similar to [0.0, 1.0, 0.0]...");
-    let results = store.query(&[0.0, 1.0, 0.0], 3).await?;
-
-    for result in &results {
-        println!(
-            "  ID: {}, Score: {:.4}, Metadata: {:?}",
-            result.id, result.score, result.metadata
-        );
-    }
-
-    println!("\nQuerying for vectors similar to [0.5, 0.5, 0.0]...");
-    let results = store.query(&[0.5, 0.5, 0.0], 3).await?;
-
-    for result in &results {
-        println!(
-            "  ID: {}, Score: {:.4}, Metadata: {:?}",
-            result.id, result.score, result.metadata
-        );
-    }
-
-    store.close().await?;
     Ok(())
 }
