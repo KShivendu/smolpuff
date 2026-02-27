@@ -6,6 +6,13 @@ use crate::errors::VectorStoreError;
 use crate::models::*;
 use crate::store::VectorStore;
 
+pub async fn root() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": "smolpuff",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
 pub async fn create_namespace(
     State(store): State<Arc<VectorStore>>,
     Json(req): Json<CreateNamespaceRequest>,

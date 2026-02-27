@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(store);
 
     let app = Router::new()
+        .route("/", get(handlers::root))
         .route("/v1/namespaces", post(handlers::create_namespace))
         .route("/v1/namespaces/{ns}", get(handlers::get_namespace))
         .route("/v1/namespaces/{ns}", delete(handlers::delete_namespace))
