@@ -3,7 +3,9 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use reqwest::Client;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::signal;
 
 #[derive(Parser)]
 #[command(name = "puffbench", about = "smolpuff benchmark")]
@@ -32,6 +34,14 @@ struct Args {
     #[arg(short = 'n', long, default_value = "bench")]
     namespace: String,
 
+    /// Query-only mode: skip create/write/delete, just query an existing namespace
+    #[arg(long)]
+    query_only: bool,
+
+    /// Grafana URL for posting annotations
+    #[arg(long, default_value = "http://localhost:3001")]
+    grafana_url: String,
+
     /// Number of concurrent requests
     #[arg(long, default_value_t = 16)]
     concurrency: usize,
@@ -58,6 +68,24 @@ impl std::fmt::Display for Stats {
     }
 }
 
+fn generate_run_id() -> String {
+    let mut rng = rand::thread_rng();
+    let id: u32 = rng.gen_range(0..0xFFFFFF);
+    format!("{id:06x}")
+}
+
+async fn annotate(client: &Client, grafana_url: &str, text: &str, tags: &[&str]) {
+    let _ = client
+        .post(format!("{grafana_url}/api/annotations"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "text": text,
+            "tags": tags,
+        }))
+        .send()
+        .await;
+}
+
 fn compute_stats(durations: &mut [Duration]) -> Stats {
     durations.sort();
     let n = durations.len();
@@ -72,6 +100,7 @@ async fn main() {
     let args = Args::parse();
     let base = &args.url;
     let ns = &args.namespace;
+    let run_id = generate_run_id();
 
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
@@ -89,89 +118,136 @@ async fn main() {
         }
     }
 
-    // Create namespace, cleaning up any leftover from a previous run
+    // Set up Ctrl+C handler to annotate abort in Grafana
+    let abort_client = client.clone();
+    let abort_grafana = args.grafana_url.clone();
+    let abort_run_id = run_id.clone();
+    let abort_run_id = Arc::new(abort_run_id);
+    let abort_run_id_clone = abort_run_id.clone();
+    tokio::spawn(async move {
+        signal::ctrl_c().await.ok();
+        annotate(
+            &abort_client,
+            &abort_grafana,
+            &format!("[{abort_run_id_clone}] Benchmark ABORTED"),
+            &["puffbench", "abort"],
+        )
+        .await;
+        std::process::exit(130);
+    });
+
+    // Annotate benchmark start in Grafana
+    let grafana = &args.grafana_url;
+    let start_text = if args.query_only {
+        format!(
+            "[{run_id}] Benchmark started: query-only, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.queries, args.dim, args.top_k, args.concurrency
+        )
+    } else {
+        format!(
+            "[{run_id}] Benchmark started: {} vectors, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.vectors, args.queries, args.dim, args.top_k, args.concurrency
+        )
+    };
+    annotate(&client, grafana, &start_text, &["puffbench", "start"]).await;
+    if args.query_only {
+        eprintln!(
+            "[{run_id}] query-only: {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.queries, args.dim, args.top_k, args.concurrency
+        );
+    } else {
+        eprintln!(
+            "[{run_id}] {} vectors, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.vectors, args.queries, args.dim, args.top_k, args.concurrency
+        );
+    }
+
     let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
         .unwrap()
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]);
 
-    let resp = client
-        .post(format!("{base}/v1/namespaces"))
-        .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
-        .send()
-        .await
-        .unwrap();
-    if resp.status() == 409 {
-        let sp = ProgressBar::new_spinner().with_style(spinner_style.clone());
-        sp.set_message("Cleaning up old namespace...");
-        sp.enable_steady_tick(Duration::from_millis(80));
-        // Delete can be slow (scans all vectors), so use a longer timeout
-        let cleanup_client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap();
-        cleanup_client
-            .delete(format!("{base}/v1/namespaces/{ns}"))
-            .send()
-            .await
-            .unwrap();
-        sp.finish_with_message("Cleaned up old namespace");
+    let bar_style = ProgressStyle::with_template(
+        "{prefix:>10.bold} {bar:40.green/black} {pos:>6}/{len} | {per_sec:>12.cyan} | eta {eta:>3.yellow} {msg:.green.bold}",
+    )
+    .unwrap()
+    .progress_chars("\u{2588}\u{2592}\u{2591}");
+
+    // Write phase (skip in query-only mode)
+    let mut write_stats = None;
+    if !args.query_only {
+        // Create namespace, cleaning up any leftover from a previous run
         let resp = client
             .post(format!("{base}/v1/namespaces"))
             .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            200,
-            "Failed to create namespace after cleanup"
-        );
-    } else {
-        assert_eq!(resp.status(), 200, "Failed to create namespace");
+        if resp.status() == 409 {
+            let sp = ProgressBar::new_spinner().with_style(spinner_style.clone());
+            sp.set_message("Cleaning up old namespace...");
+            sp.enable_steady_tick(Duration::from_millis(80));
+            let cleanup_client = Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .unwrap();
+            cleanup_client
+                .delete(format!("{base}/v1/namespaces/{ns}"))
+                .send()
+                .await
+                .unwrap();
+            sp.finish_with_message("Cleaned up old namespace");
+            let resp = client
+                .post(format!("{base}/v1/namespaces"))
+                .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "Failed to create namespace after cleanup"
+            );
+        } else {
+            assert_eq!(resp.status(), 200, "Failed to create namespace");
+        }
+
+        let pb = ProgressBar::new(args.vectors as u64)
+            .with_prefix("Writing")
+            .with_style(bar_style.clone());
+        pb.enable_steady_tick(Duration::from_millis(100));
+        let mut write_durations: Vec<Duration> = stream::iter(0..args.vectors)
+            .map(|i| {
+                let client = client.clone();
+                let url = format!("{base}/v1/namespaces/{ns}/write");
+                let vector = generate_random_vector(args.dim);
+                let pb = pb.clone();
+                async move {
+                    let start = Instant::now();
+                    client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "id": format!("v{i}"),
+                            "vector": vector,
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    pb.inc(1);
+                    start.elapsed()
+                }
+            })
+            .buffer_unordered(args.concurrency)
+            .collect()
+            .await;
+        let ws = compute_stats(&mut write_durations);
+        pb.finish_with_message(format!("done ({ws})"));
+        write_stats = Some(ws);
     }
-
-    let style = ProgressStyle::with_template(
-        "{prefix:>10.bold} {bar:40.green/black} {pos:>6}/{len} | {per_sec:>12.cyan} | eta {eta:>3.yellow} {msg:.green.bold}",
-    )
-    .unwrap()
-    .progress_chars("\u{2588}\u{2592}\u{2591}");
-
-    // Write phase
-    let pb = ProgressBar::new(args.vectors as u64)
-        .with_prefix("Writing")
-        .with_style(style.clone());
-    pb.enable_steady_tick(Duration::from_millis(100));
-    let mut write_durations: Vec<Duration> = stream::iter(0..args.vectors)
-        .map(|i| {
-            let client = client.clone();
-            let url = format!("{base}/v1/namespaces/{ns}/write");
-            let vector = generate_random_vector(args.dim);
-            let pb = pb.clone();
-            async move {
-                let start = Instant::now();
-                client
-                    .post(&url)
-                    .json(&serde_json::json!({
-                        "id": format!("v{i}"),
-                        "vector": vector,
-                    }))
-                    .send()
-                    .await
-                    .unwrap();
-                pb.inc(1);
-                start.elapsed()
-            }
-        })
-        .buffer_unordered(args.concurrency)
-        .collect()
-        .await;
-    let write_stats = compute_stats(&mut write_durations);
-    pb.finish_with_message(format!("done ({write_stats})"));
 
     // Query phase
     let pb = ProgressBar::new(args.queries as u64)
         .with_prefix("Querying")
-        .with_style(style);
+        .with_style(bar_style);
     pb.enable_steady_tick(Duration::from_millis(100));
     let mut query_durations: Vec<Duration> = stream::iter(0..args.queries)
         .map(|_| {
@@ -201,26 +277,44 @@ async fn main() {
     let query_stats = compute_stats(&mut query_durations);
     pb.finish_with_message(format!("done ({query_stats})"));
 
-    // Delete namespace
-    let sp = ProgressBar::new_spinner().with_style(spinner_style);
-    sp.set_message("Cleaning up...");
-    sp.enable_steady_tick(Duration::from_millis(80));
-    let cleanup_client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap();
-    cleanup_client
-        .delete(format!("{base}/v1/namespaces/{ns}"))
-        .send()
-        .await
-        .unwrap();
-    sp.finish_and_clear();
+    // Delete namespace (skip in query-only mode)
+    if !args.query_only {
+        let sp = ProgressBar::new_spinner().with_style(spinner_style);
+        sp.set_message("Cleaning up...");
+        sp.enable_steady_tick(Duration::from_millis(80));
+        let cleanup_client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        cleanup_client
+            .delete(format!("{base}/v1/namespaces/{ns}"))
+            .send()
+            .await
+            .unwrap();
+        sp.finish_and_clear();
+    }
+
+    // Annotate benchmark end in Grafana
+    let end_text = if let Some(ws) = &write_stats {
+        format!("[{run_id}] Benchmark finished — Write: {ws} | Query: {query_stats}")
+    } else {
+        format!("[{run_id}] Benchmark finished — Query: {query_stats}")
+    };
+    annotate(&client, grafana, &end_text, &["puffbench", "end"]).await;
 
     // Summary
-    println!(
-        "puffbench: wrote {} vectors, ran {} queries (dim={}, top_k={}, concurrency={})",
-        args.vectors, args.queries, args.dim, args.top_k, args.concurrency
-    );
-    println!("Write: {write_stats}  Query: {query_stats}");
+    if let Some(ws) = &write_stats {
+        println!(
+            "puffbench: wrote {} vectors, ran {} queries (dim={}, top_k={}, concurrency={})",
+            args.vectors, args.queries, args.dim, args.top_k, args.concurrency
+        );
+        println!("Write: {ws}  Query: {query_stats}");
+    } else {
+        println!(
+            "puffbench: ran {} queries on namespace \"{ns}\" (dim={}, top_k={}, concurrency={})",
+            args.queries, args.dim, args.top_k, args.concurrency
+        );
+        println!("Query: {query_stats}");
+    }
     println!("See Grafana at http://localhost:3001 for details");
 }
