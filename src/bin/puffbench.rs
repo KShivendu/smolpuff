@@ -90,6 +90,10 @@ async fn main() {
     }
 
     // Create namespace, cleaning up any leftover from a previous run
+    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        .unwrap()
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]);
+
     let resp = client
         .post(format!("{base}/v1/namespaces"))
         .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
@@ -97,7 +101,9 @@ async fn main() {
         .await
         .unwrap();
     if resp.status() == 409 {
-        eprint!("Cleaning up old namespace... ");
+        let sp = ProgressBar::new_spinner().with_style(spinner_style.clone());
+        sp.set_message("Cleaning up old namespace...");
+        sp.enable_steady_tick(Duration::from_millis(80));
         // Delete can be slow (scans all vectors), so use a longer timeout
         let cleanup_client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -108,7 +114,7 @@ async fn main() {
             .send()
             .await
             .unwrap();
-        eprintln!("done");
+        sp.finish_with_message("Cleaned up old namespace");
         let resp = client
             .post(format!("{base}/v1/namespaces"))
             .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
@@ -196,11 +202,19 @@ async fn main() {
     pb.finish_with_message(format!("done ({query_stats})"));
 
     // Delete namespace
-    client
+    let sp = ProgressBar::new_spinner().with_style(spinner_style);
+    sp.set_message("Cleaning up...");
+    sp.enable_steady_tick(Duration::from_millis(80));
+    let cleanup_client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+    cleanup_client
         .delete(format!("{base}/v1/namespaces/{ns}"))
         .send()
         .await
         .unwrap();
+    sp.finish_and_clear();
 
     // Summary
     println!(
