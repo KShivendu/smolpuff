@@ -28,6 +28,10 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     top_k: usize,
 
+    /// Namespace name
+    #[arg(long, default_value = "bench")]
+    namespace: String,
+
     /// Number of concurrent requests
     #[arg(long, default_value_t = 16)]
     concurrency: usize,
@@ -67,7 +71,7 @@ fn compute_stats(durations: &mut [Duration]) -> Stats {
 async fn main() {
     let args = Args::parse();
     let base = &args.url;
-    let ns = "bench";
+    let ns = &args.namespace;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
