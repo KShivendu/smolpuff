@@ -1,40 +1,44 @@
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use reqwest::Client;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "puffbench", about = "smolpuff API benchmark")]
+#[command(name = "puffbench", about = "smolpuff benchmark")]
 struct Args {
     /// Server URL
     #[arg(long, default_value = "http://127.0.0.1:3000")]
     url: String,
 
-    /// Workloads to run (comma-separated)
-    /// Values: write-latency, write-throughput, query-latency, query-topk, all
-    #[arg(long, value_delimiter = ',', default_value = "all")]
-    workload: Vec<String>,
+    /// Number of vectors to write
+    #[arg(long, default_value_t = 1000)]
+    vectors: usize,
 
-    /// Vector dimensions for write-latency
-    #[arg(long = "dim", value_delimiter = ',', default_values_t = vec![64, 128, 256, 512])]
-    dims: Vec<usize>,
+    /// Number of queries to run
+    #[arg(long, default_value_t = 200)]
+    queries: usize,
 
-    /// Write counts for write-throughput
-    #[arg(long = "count", value_delimiter = ',', default_values_t = vec![500, 2000, 5000])]
-    counts: Vec<usize>,
+    /// Vector dimension
+    #[arg(long, default_value_t = 128)]
+    dim: usize,
 
-    /// Store sizes for query-latency
-    #[arg(long = "store-size", value_delimiter = ',', default_values_t = vec![100, 500, 1000])]
-    store_sizes: Vec<usize>,
+    /// Query top_k
+    #[arg(long, default_value_t = 10)]
+    top_k: usize,
 
-    /// Top-k values for query-topk
-    #[arg(long = "top-k", value_delimiter = ',', default_values_t = vec![1, 5, 10, 50])]
-    top_ks: Vec<usize>,
+    /// Namespace name
+    #[arg(short = 'n', long, default_value = "bench")]
+    namespace: String,
 
-    /// Iterations per measurement point
-    #[arg(long, default_value_t = 50)]
-    iters: usize,
+    /// Query-only mode: skip create/write/delete, just query an existing namespace
+    #[arg(long)]
+    query_only: bool,
+
+    /// Grafana URL for posting annotations
+    #[arg(long, default_value = "http://localhost:3001")]
+    grafana_url: String,
 
     /// Number of concurrent requests
     #[arg(long, default_value_t = 16)]
@@ -46,268 +50,53 @@ fn generate_random_vector(dim: usize) -> Vec<f32> {
     (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
 }
 
-async fn create_ns(client: &Client, base: &str, ns: &str, dim: usize) {
-    let resp = client
-        .post(format!("{base}/v1/namespaces"))
-        .json(&serde_json::json!({ "name": ns, "vector_dim": dim }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "Failed to create namespace {ns}");
-}
-
-async fn delete_ns(client: &Client, base: &str, ns: &str) {
-    client
-        .delete(format!("{base}/v1/namespaces/{ns}"))
-        .send()
-        .await
-        .unwrap();
-}
-
-async fn populate(
-    client: &Client,
-    base: &str,
-    ns: &str,
-    dim: usize,
-    count: usize,
-    concurrency: usize,
-) {
-    create_ns(client, base, ns, dim).await;
-    stream::iter(0..count)
-        .map(|i| {
-            let client = client.clone();
-            let url = format!("{base}/v1/namespaces/{ns}/write");
-            let vector = generate_random_vector(dim);
-            async move {
-                client
-                    .post(&url)
-                    .json(&serde_json::json!({
-                        "id": format!("v{i}"),
-                        "vector": vector,
-                    }))
-                    .send()
-                    .await
-                    .unwrap();
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect::<Vec<()>>()
-        .await;
-}
-
 struct Stats {
-    min: Duration,
-    avg: Duration,
     p50: Duration,
     p99: Duration,
-    max: Duration,
 }
 
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "min={:.2}ms  avg={:.2}ms  p50={:.2}ms  p99={:.2}ms  max={:.2}ms",
-            self.min.as_secs_f64() * 1000.0,
-            self.avg.as_secs_f64() * 1000.0,
+            "p50={:.1}ms p99={:.1}ms",
             self.p50.as_secs_f64() * 1000.0,
             self.p99.as_secs_f64() * 1000.0,
-            self.max.as_secs_f64() * 1000.0,
         )
     }
+}
+
+async fn annotate(client: &Client, grafana_url: &str, text: &str, tags: &[&str]) {
+    let _ = client
+        .post(format!("{grafana_url}/api/annotations"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "text": text,
+            "tags": tags,
+        }))
+        .send()
+        .await;
 }
 
 fn compute_stats(durations: &mut [Duration]) -> Stats {
     durations.sort();
     let n = durations.len();
-    let total: Duration = durations.iter().sum();
     Stats {
-        min: durations[0],
-        avg: total / n as u32,
         p50: durations[n / 2],
         p99: durations[(n as f64 * 0.99) as usize],
-        max: durations[n - 1],
     }
-}
-
-async fn bench_write_latency(
-    client: &Client,
-    base: &str,
-    dims: &[usize],
-    iters: usize,
-    concurrency: usize,
-) {
-    println!("\n=== Write Latency (per-upsert round-trip) ===");
-
-    for &dim in dims {
-        let ns = format!("bench_wl_{dim}");
-        create_ns(client, base, &ns, dim).await;
-
-        let mut durations: Vec<Duration> = stream::iter(0..iters)
-            .map(|i| {
-                let client = client.clone();
-                let url = format!("{base}/v1/namespaces/{ns}/write");
-                let vector = generate_random_vector(dim);
-                async move {
-                    let start = Instant::now();
-                    client
-                        .post(&url)
-                        .json(&serde_json::json!({
-                            "id": format!("v{i}"),
-                            "vector": vector,
-                        }))
-                        .send()
-                        .await
-                        .unwrap();
-                    start.elapsed()
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
-
-        let stats = compute_stats(&mut durations);
-        println!("  dim={dim:<4}  {stats}");
-        delete_ns(client, base, &ns).await;
-    }
-}
-
-async fn bench_write_throughput(client: &Client, base: &str, counts: &[usize], concurrency: usize) {
-    println!("\n=== Write Throughput (bulk upsert) ===");
-    let dim = 128;
-
-    for &count in counts {
-        let ns = format!("bench_wt_{count}");
-        create_ns(client, base, &ns, dim).await;
-
-        let start = Instant::now();
-        stream::iter(0..count)
-            .map(|i| {
-                let client = client.clone();
-                let url = format!("{base}/v1/namespaces/{ns}/write");
-                let vector = generate_random_vector(dim);
-                async move {
-                    client
-                        .post(&url)
-                        .json(&serde_json::json!({
-                            "id": format!("v{i}"),
-                            "vector": vector,
-                        }))
-                        .send()
-                        .await
-                        .unwrap();
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<()>>()
-            .await;
-        let elapsed = start.elapsed();
-        let ops_sec = count as f64 / elapsed.as_secs_f64();
-
-        println!(
-            "  count={count:<5}  total={:.2}ms  ops/sec={:.0}",
-            elapsed.as_secs_f64() * 1000.0,
-            ops_sec,
-        );
-        delete_ns(client, base, &ns).await;
-    }
-}
-
-async fn bench_query_latency(
-    client: &Client,
-    base: &str,
-    store_sizes: &[usize],
-    iters: usize,
-    concurrency: usize,
-) {
-    println!("\n=== Query Latency (top_k=10) ===");
-    let dim = 128;
-    let top_k = 10;
-
-    for &store_size in store_sizes {
-        let ns = format!("bench_ql_{store_size}");
-        populate(client, base, &ns, dim, store_size, concurrency).await;
-
-        let mut durations: Vec<Duration> = stream::iter(0..iters)
-            .map(|_| {
-                let client = client.clone();
-                let url = format!("{base}/v1/namespaces/{ns}/query");
-                let vector = generate_random_vector(dim);
-                async move {
-                    let start = Instant::now();
-                    client
-                        .post(&url)
-                        .json(&serde_json::json!({
-                            "vector": vector,
-                            "top_k": top_k,
-                        }))
-                        .send()
-                        .await
-                        .unwrap();
-                    start.elapsed()
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
-
-        let stats = compute_stats(&mut durations);
-        println!("  n={store_size:<5}  {stats}");
-        delete_ns(client, base, &ns).await;
-    }
-}
-
-async fn bench_query_varying_k(
-    client: &Client,
-    base: &str,
-    top_ks: &[usize],
-    iters: usize,
-    concurrency: usize,
-) {
-    println!("\n=== Query Varying top_k (store_size=500) ===");
-    let dim = 128;
-    let store_size = 500;
-
-    let ns = "bench_qk";
-    populate(client, base, ns, dim, store_size, concurrency).await;
-
-    for &top_k in top_ks {
-        let mut durations: Vec<Duration> = stream::iter(0..iters)
-            .map(|_| {
-                let client = client.clone();
-                let url = format!("{base}/v1/namespaces/{ns}/query");
-                let vector = generate_random_vector(dim);
-                async move {
-                    let start = Instant::now();
-                    client
-                        .post(&url)
-                        .json(&serde_json::json!({
-                            "vector": vector,
-                            "top_k": top_k,
-                        }))
-                        .send()
-                        .await
-                        .unwrap();
-                    start.elapsed()
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
-
-        let stats = compute_stats(&mut durations);
-        println!("  top_k={top_k:<3}  {stats}");
-    }
-
-    delete_ns(client, base, ns).await;
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     let base = &args.url;
+    let ns = &args.namespace;
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
     match client.get(format!("{base}/")).send().await {
         Ok(resp) if resp.status().is_success() => {}
         Ok(resp) => {
@@ -320,24 +109,174 @@ async fn main() {
         }
     }
 
-    let run_all = args.workload.iter().any(|w| w == "all");
-    let concurrency = args.concurrency;
+    // Annotate benchmark start in Grafana
+    let grafana = &args.grafana_url;
+    let start_text = if args.query_only {
+        format!(
+            "Benchmark started: query-only, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.queries, args.dim, args.top_k, args.concurrency
+        )
+    } else {
+        format!(
+            "Benchmark started: {} vectors, {} queries (ns={ns}, dim={}, top_k={}, concurrency={})",
+            args.vectors, args.queries, args.dim, args.top_k, args.concurrency
+        )
+    };
+    annotate(&client, grafana, &start_text, &["puffbench", "start"]).await;
 
-    println!("smolpuff API benchmark");
-    println!("Target: {base}  Concurrency: {concurrency}");
+    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        .unwrap()
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]);
 
-    if run_all || args.workload.iter().any(|w| w == "write-latency") {
-        bench_write_latency(&client, base, &args.dims, args.iters, concurrency).await;
-    }
-    if run_all || args.workload.iter().any(|w| w == "write-throughput") {
-        bench_write_throughput(&client, base, &args.counts, concurrency).await;
-    }
-    if run_all || args.workload.iter().any(|w| w == "query-latency") {
-        bench_query_latency(&client, base, &args.store_sizes, args.iters, concurrency).await;
-    }
-    if run_all || args.workload.iter().any(|w| w == "query-topk") {
-        bench_query_varying_k(&client, base, &args.top_ks, args.iters, concurrency).await;
+    let bar_style = ProgressStyle::with_template(
+        "{prefix:>10.bold} {bar:40.green/black} {pos:>6}/{len} | {per_sec:>12.cyan} | eta {eta:>3.yellow} {msg:.green.bold}",
+    )
+    .unwrap()
+    .progress_chars("\u{2588}\u{2592}\u{2591}");
+
+    // Write phase (skip in query-only mode)
+    let mut write_stats = None;
+    if !args.query_only {
+        // Create namespace, cleaning up any leftover from a previous run
+        let resp = client
+            .post(format!("{base}/v1/namespaces"))
+            .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 409 {
+            let sp = ProgressBar::new_spinner().with_style(spinner_style.clone());
+            sp.set_message("Cleaning up old namespace...");
+            sp.enable_steady_tick(Duration::from_millis(80));
+            let cleanup_client = Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .unwrap();
+            cleanup_client
+                .delete(format!("{base}/v1/namespaces/{ns}"))
+                .send()
+                .await
+                .unwrap();
+            sp.finish_with_message("Cleaned up old namespace");
+            let resp = client
+                .post(format!("{base}/v1/namespaces"))
+                .json(&serde_json::json!({ "name": ns, "vector_dim": args.dim }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "Failed to create namespace after cleanup"
+            );
+        } else {
+            assert_eq!(resp.status(), 200, "Failed to create namespace");
+        }
+
+        let pb = ProgressBar::new(args.vectors as u64)
+            .with_prefix("Writing")
+            .with_style(bar_style.clone());
+        pb.enable_steady_tick(Duration::from_millis(100));
+        let mut write_durations: Vec<Duration> = stream::iter(0..args.vectors)
+            .map(|i| {
+                let client = client.clone();
+                let url = format!("{base}/v1/namespaces/{ns}/write");
+                let vector = generate_random_vector(args.dim);
+                let pb = pb.clone();
+                async move {
+                    let start = Instant::now();
+                    client
+                        .post(&url)
+                        .json(&serde_json::json!({
+                            "id": format!("v{i}"),
+                            "vector": vector,
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    pb.inc(1);
+                    start.elapsed()
+                }
+            })
+            .buffer_unordered(args.concurrency)
+            .collect()
+            .await;
+        let ws = compute_stats(&mut write_durations);
+        pb.finish_with_message(format!("done ({ws})"));
+        write_stats = Some(ws);
     }
 
-    println!("\nDone.");
+    // Query phase
+    let pb = ProgressBar::new(args.queries as u64)
+        .with_prefix("Querying")
+        .with_style(bar_style);
+    pb.enable_steady_tick(Duration::from_millis(100));
+    let mut query_durations: Vec<Duration> = stream::iter(0..args.queries)
+        .map(|_| {
+            let client = client.clone();
+            let url = format!("{base}/v1/namespaces/{ns}/query");
+            let vector = generate_random_vector(args.dim);
+            let top_k = args.top_k;
+            let pb = pb.clone();
+            async move {
+                let start = Instant::now();
+                client
+                    .post(&url)
+                    .json(&serde_json::json!({
+                        "vector": vector,
+                        "top_k": top_k,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                pb.inc(1);
+                start.elapsed()
+            }
+        })
+        .buffer_unordered(args.concurrency)
+        .collect()
+        .await;
+    let query_stats = compute_stats(&mut query_durations);
+    pb.finish_with_message(format!("done ({query_stats})"));
+
+    // Delete namespace (skip in query-only mode)
+    if !args.query_only {
+        let sp = ProgressBar::new_spinner().with_style(spinner_style);
+        sp.set_message("Cleaning up...");
+        sp.enable_steady_tick(Duration::from_millis(80));
+        let cleanup_client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        cleanup_client
+            .delete(format!("{base}/v1/namespaces/{ns}"))
+            .send()
+            .await
+            .unwrap();
+        sp.finish_and_clear();
+    }
+
+    // Annotate benchmark end in Grafana
+    let end_text = if let Some(ws) = &write_stats {
+        format!("Benchmark finished — Write: {ws} | Query: {query_stats}")
+    } else {
+        format!("Benchmark finished — Query: {query_stats}")
+    };
+    annotate(&client, grafana, &end_text, &["puffbench", "end"]).await;
+
+    // Summary
+    if let Some(ws) = &write_stats {
+        println!(
+            "puffbench: wrote {} vectors, ran {} queries (dim={}, top_k={}, concurrency={})",
+            args.vectors, args.queries, args.dim, args.top_k, args.concurrency
+        );
+        println!("Write: {ws}  Query: {query_stats}");
+    } else {
+        println!(
+            "puffbench: ran {} queries on namespace \"{ns}\" (dim={}, top_k={}, concurrency={})",
+            args.queries, args.dim, args.top_k, args.concurrency
+        );
+        println!("Query: {query_stats}");
+    }
+    println!("See Grafana at http://localhost:3001 for details");
 }
