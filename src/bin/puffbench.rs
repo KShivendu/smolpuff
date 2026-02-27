@@ -29,7 +29,7 @@ struct Args {
     top_k: usize,
 
     /// Namespace name
-    #[arg(long, default_value = "bench")]
+    #[arg(short = 'n', long, default_value = "bench")]
     namespace: String,
 
     /// Number of concurrent requests
