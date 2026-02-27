@@ -1,11 +1,11 @@
+use axum::Router;
 use axum::middleware;
 use axum::routing::{delete, get, post};
-use axum::Router;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use object_store::ObjectStore;
+use smolpuff::VectorStore;
 use smolpuff::handlers;
 use smolpuff::metrics::track_metrics;
-use smolpuff::VectorStore;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 

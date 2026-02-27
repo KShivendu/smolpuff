@@ -12,11 +12,7 @@ pub async fn track_metrics(request: Request, next: Next) -> Response {
 
     let status = response.status().as_u16().to_string();
 
-    let labels = [
-        ("method", method),
-        ("path", path),
-        ("status", status),
-    ];
+    let labels = [("method", method), ("path", path), ("status", status)];
 
     counter!("http_requests_total", &labels).increment(1);
     histogram!("http_request_duration_seconds", &labels).record(duration);

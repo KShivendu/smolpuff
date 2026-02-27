@@ -1,10 +1,12 @@
 use crate::errors::VectorStoreError;
 use crate::models::NamespaceMetadata;
 use chrono::Utc;
+use metrics::{counter, histogram};
 use object_store::ObjectStore;
 use slatedb::Db;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::time::Instant;
 
 const DEFAULT_NS: &str = "_default";
 const DEFAULT_DIM: usize = 0; // 0 means "any dimension" for backward compat
@@ -37,6 +39,24 @@ pub struct VectorStore {
     db: Db,
 }
 
+fn record_op(operation: &str, namespace: &str, start: Instant, succeeded: bool) {
+    let status = if succeeded { "ok" } else { "error" };
+    let labels = [
+        ("operation", operation.to_string()),
+        ("namespace", namespace.to_string()),
+        ("status", status.to_string()),
+    ];
+    counter!("store_operations_total", &labels).increment(1);
+    histogram!(
+        "store_operation_duration_seconds",
+        &[
+            ("operation", operation.to_string()),
+            ("namespace", namespace.to_string()),
+        ]
+    )
+    .record(start.elapsed().as_secs_f64());
+}
+
 impl VectorStore {
     pub async fn open<P: AsRef<str>>(
         path: P,
@@ -54,70 +74,87 @@ impl VectorStore {
         vector_dim: usize,
         distance: &str,
     ) -> Result<NamespaceMetadata, VectorStoreError> {
-        let meta_key = format!("ns:{name}:meta");
+        let start = Instant::now();
+        let result = async {
+            let meta_key = format!("ns:{name}:meta");
 
-        // Check if namespace already exists
-        if self.db.get(meta_key.as_bytes()).await?.is_some() {
-            return Err(VectorStoreError::NamespaceAlreadyExists(name.to_string()));
+            // Check if namespace already exists
+            if self.db.get(meta_key.as_bytes()).await?.is_some() {
+                return Err(VectorStoreError::NamespaceAlreadyExists(name.to_string()));
+            }
+
+            let metadata = NamespaceMetadata {
+                name: name.to_string(),
+                vector_dim,
+                distance: distance.to_string(),
+                approx_row_count: 0,
+                created_at: Utc::now(),
+            };
+
+            let value = serde_json::to_vec(&metadata)?;
+            self.db.put(meta_key.as_bytes(), &value).await?;
+
+            Ok(metadata)
         }
-
-        let metadata = NamespaceMetadata {
-            name: name.to_string(),
-            vector_dim,
-            distance: distance.to_string(),
-            approx_row_count: 0,
-            created_at: Utc::now(),
-        };
-
-        let value = serde_json::to_vec(&metadata)?;
-        self.db.put(meta_key.as_bytes(), &value).await?;
-
-        Ok(metadata)
+        .await;
+        record_op("create_namespace", name, start, result.is_ok());
+        result
     }
 
     pub async fn get_namespace(&self, name: &str) -> Result<NamespaceMetadata, VectorStoreError> {
-        let meta_key = format!("ns:{name}:meta");
-
-        match self.db.get(meta_key.as_bytes()).await? {
-            Some(value) => Ok(serde_json::from_slice(&value)?),
-            None => Err(VectorStoreError::NamespaceNotFound(name.to_string())),
+        let start = Instant::now();
+        let result = async {
+            let meta_key = format!("ns:{name}:meta");
+            match self.db.get(meta_key.as_bytes()).await? {
+                Some(value) => Ok(serde_json::from_slice(&value)?),
+                None => Err(VectorStoreError::NamespaceNotFound(name.to_string())),
+            }
         }
+        .await;
+        record_op("get_namespace", name, start, result.is_ok());
+        result
     }
 
     pub async fn delete_namespace(&self, name: &str) -> Result<(), VectorStoreError> {
-        let meta_key = format!("ns:{name}:meta");
+        let start = Instant::now();
+        let result = async {
+            let meta_key = format!("ns:{name}:meta");
 
-        // Verify namespace exists
-        if self.db.get(meta_key.as_bytes()).await?.is_none() {
-            return Err(VectorStoreError::NamespaceNotFound(name.to_string()));
+            // Verify namespace exists
+            if self.db.get(meta_key.as_bytes()).await?.is_none() {
+                return Err(VectorStoreError::NamespaceNotFound(name.to_string()));
+            }
+
+            // Delete all vec keys for this namespace
+            let vec_prefix = format!("ns:{name}:vec:");
+            let vec_end = format!("ns:{name}:vec;");
+            let mut iter = self
+                .db
+                .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
+                .await?;
+            while let Ok(Some(item)) = iter.next().await {
+                self.db.delete(&item.key).await?;
+            }
+
+            // Delete all doc keys for this namespace
+            let doc_prefix = format!("ns:{name}:doc:");
+            let doc_end = format!("ns:{name}:doc;");
+            let mut iter = self
+                .db
+                .scan(doc_prefix.as_bytes()..doc_end.as_bytes())
+                .await?;
+            while let Ok(Some(item)) = iter.next().await {
+                self.db.delete(&item.key).await?;
+            }
+
+            // Delete the metadata key
+            self.db.delete(meta_key.as_bytes()).await?;
+
+            Ok(())
         }
-
-        // Delete all vec keys for this namespace
-        let vec_prefix = format!("ns:{name}:vec:");
-        let vec_end = format!("ns:{name}:vec;");
-        let mut iter = self
-            .db
-            .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
-            .await?;
-        while let Ok(Some(item)) = iter.next().await {
-            self.db.delete(&item.key).await?;
-        }
-
-        // Delete all doc keys for this namespace
-        let doc_prefix = format!("ns:{name}:doc:");
-        let doc_end = format!("ns:{name}:doc;");
-        let mut iter = self
-            .db
-            .scan(doc_prefix.as_bytes()..doc_end.as_bytes())
-            .await?;
-        while let Ok(Some(item)) = iter.next().await {
-            self.db.delete(&item.key).await?;
-        }
-
-        // Delete the metadata key
-        self.db.delete(meta_key.as_bytes()).await?;
-
-        Ok(())
+        .await;
+        record_op("delete_namespace", name, start, result.is_ok());
+        result
     }
 
     // --- Data operations ---
@@ -129,38 +166,44 @@ impl VectorStore {
         vector: Vec<f32>,
         attributes: Option<serde_json::Value>,
     ) -> Result<(), VectorStoreError> {
-        // Get namespace metadata to validate dimensions
-        let meta = self.get_namespace(ns).await?;
+        let start = Instant::now();
+        let result = async {
+            // Get namespace metadata to validate dimensions
+            let meta = self.get_namespace(ns).await?;
 
-        if meta.vector_dim > 0 && vector.len() != meta.vector_dim {
-            return Err(VectorStoreError::DimensionMismatch {
-                expected: meta.vector_dim,
-                got: vector.len(),
-            });
+            if meta.vector_dim > 0 && vector.len() != meta.vector_dim {
+                return Err(VectorStoreError::DimensionMismatch {
+                    expected: meta.vector_dim,
+                    got: vector.len(),
+                });
+            }
+
+            // Store vector as raw f32 le_bytes
+            let vec_key = format!("ns:{ns}:vec:{id}");
+            let vec_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            self.db.put(vec_key.as_bytes(), &vec_bytes).await?;
+
+            // Store attributes separately as JSON
+            let doc_key = format!("ns:{ns}:doc:{id}");
+            if let Some(attrs) = &attributes {
+                let doc_bytes = serde_json::to_vec(attrs)?;
+                self.db.put(doc_key.as_bytes(), &doc_bytes).await?;
+            }
+
+            // Update approx row count (best effort — not atomic)
+            let meta_key = format!("ns:{ns}:meta");
+            let updated_meta = NamespaceMetadata {
+                approx_row_count: meta.approx_row_count + 1,
+                ..meta
+            };
+            let meta_bytes = serde_json::to_vec(&updated_meta)?;
+            self.db.put(meta_key.as_bytes(), &meta_bytes).await?;
+
+            Ok(())
         }
-
-        // Store vector as raw f32 le_bytes
-        let vec_key = format!("ns:{ns}:vec:{id}");
-        let vec_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-        self.db.put(vec_key.as_bytes(), &vec_bytes).await?;
-
-        // Store attributes separately as JSON
-        let doc_key = format!("ns:{ns}:doc:{id}");
-        if let Some(attrs) = &attributes {
-            let doc_bytes = serde_json::to_vec(attrs)?;
-            self.db.put(doc_key.as_bytes(), &doc_bytes).await?;
-        }
-
-        // Update approx row count (best effort — not atomic)
-        let meta_key = format!("ns:{ns}:meta");
-        let updated_meta = NamespaceMetadata {
-            approx_row_count: meta.approx_row_count + 1,
-            ..meta
-        };
-        let meta_bytes = serde_json::to_vec(&updated_meta)?;
-        self.db.put(meta_key.as_bytes(), &meta_bytes).await?;
-
-        Ok(())
+        .await;
+        record_op("upsert", ns, start, result.is_ok());
+        result
     }
 
     pub async fn query_ns(
@@ -169,71 +212,77 @@ impl VectorStore {
         query_vector: &[f32],
         top_k: usize,
     ) -> Result<Vec<crate::models::QueryResultItem>, VectorStoreError> {
-        // Verify namespace exists
-        let meta = self.get_namespace(ns).await?;
+        let start = Instant::now();
+        let result = async {
+            // Verify namespace exists
+            let meta = self.get_namespace(ns).await?;
 
-        if meta.vector_dim > 0 && query_vector.len() != meta.vector_dim {
-            return Err(VectorStoreError::DimensionMismatch {
-                expected: meta.vector_dim,
-                got: query_vector.len(),
-            });
-        }
-
-        let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::new();
-
-        // Scan all vectors in this namespace
-        let vec_prefix = format!("ns:{ns}:vec:");
-        let vec_end = format!("ns:{ns}:vec;");
-        let mut iter = self
-            .db
-            .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
-            .await?;
-
-        while let Ok(Some(item)) = iter.next().await {
-            // Extract id from key: "ns:{ns}:vec:{id}"
-            let key_str = String::from_utf8_lossy(&item.key);
-            let id = key_str.strip_prefix(&vec_prefix).unwrap_or("").to_string();
-
-            // Decode vector from le_bytes
-            let vec_data = decode_f32_vec(&item.value);
-            let score = cosine_similarity(query_vector, &vec_data);
-
-            let scored = ScoredItem { score, id };
-
-            if heap.len() < top_k {
-                heap.push(scored);
-            } else if let Some(min_item) = heap.peek()
-                && score > min_item.score
-            {
-                heap.pop();
-                heap.push(scored);
+            if meta.vector_dim > 0 && query_vector.len() != meta.vector_dim {
+                return Err(VectorStoreError::DimensionMismatch {
+                    expected: meta.vector_dim,
+                    got: query_vector.len(),
+                });
             }
-        }
 
-        // Collect top-k IDs, sorted by score descending
-        let mut scored_ids: Vec<ScoredItem> = heap.into_iter().collect();
-        scored_ids.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+            let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::new();
 
-        // Fetch attributes only for top-k results
-        let mut results = Vec::with_capacity(scored_ids.len());
-        for si in scored_ids {
-            let doc_key = format!("ns:{ns}:doc:{}", si.id);
-            let attributes = match self.db.get(doc_key.as_bytes()).await? {
-                Some(val) => Some(serde_json::from_slice(&val)?),
-                None => None,
-            };
-            results.push(crate::models::QueryResultItem {
-                id: si.id,
-                score: si.score,
-                attributes,
+            // Scan all vectors in this namespace
+            let vec_prefix = format!("ns:{ns}:vec:");
+            let vec_end = format!("ns:{ns}:vec;");
+            let mut iter = self
+                .db
+                .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
+                .await?;
+
+            while let Ok(Some(item)) = iter.next().await {
+                // Extract id from key: "ns:{ns}:vec:{id}"
+                let key_str = String::from_utf8_lossy(&item.key);
+                let id = key_str.strip_prefix(&vec_prefix).unwrap_or("").to_string();
+
+                // Decode vector from le_bytes
+                let vec_data = decode_f32_vec(&item.value);
+                let score = cosine_similarity(query_vector, &vec_data);
+
+                let scored = ScoredItem { score, id };
+
+                if heap.len() < top_k {
+                    heap.push(scored);
+                } else if let Some(min_item) = heap.peek()
+                    && score > min_item.score
+                {
+                    heap.pop();
+                    heap.push(scored);
+                }
+            }
+
+            // Collect top-k IDs, sorted by score descending
+            let mut scored_ids: Vec<ScoredItem> = heap.into_iter().collect();
+            scored_ids.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
-        }
 
-        Ok(results)
+            // Fetch attributes only for top-k results
+            let mut results = Vec::with_capacity(scored_ids.len());
+            for si in scored_ids {
+                let doc_key = format!("ns:{ns}:doc:{}", si.id);
+                let attributes = match self.db.get(doc_key.as_bytes()).await? {
+                    Some(val) => Some(serde_json::from_slice(&val)?),
+                    None => None,
+                };
+                results.push(crate::models::QueryResultItem {
+                    id: si.id,
+                    score: si.score,
+                    attributes,
+                });
+            }
+
+            Ok(results)
+        }
+        .await;
+        record_op("query", ns, start, result.is_ok());
+        result
     }
 
     // --- Backward-compatible methods for benchmarks ---
