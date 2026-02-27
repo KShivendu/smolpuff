@@ -1,5 +1,6 @@
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use reqwest::Client;
 use std::time::{Duration, Instant};
@@ -90,12 +91,20 @@ async fn main() {
         .unwrap();
     assert_eq!(resp.status(), 200, "Failed to create namespace");
 
+    let style = ProgressStyle::with_template("{prefix} [{bar:30}] {pos}/{len} ({per_sec})")
+        .unwrap()
+        .progress_chars("=> ");
+
     // Write phase
+    let pb = ProgressBar::new(args.vectors as u64)
+        .with_prefix("Writing")
+        .with_style(style.clone());
     let mut write_durations: Vec<Duration> = stream::iter(0..args.vectors)
         .map(|i| {
             let client = client.clone();
             let url = format!("{base}/v1/namespaces/{ns}/write");
             let vector = generate_random_vector(args.dim);
+            let pb = pb.clone();
             async move {
                 let start = Instant::now();
                 client
@@ -107,22 +116,28 @@ async fn main() {
                     .send()
                     .await
                     .unwrap();
+                pb.inc(1);
                 start.elapsed()
             }
         })
         .buffer_unordered(args.concurrency)
         .collect()
         .await;
+    pb.finish();
 
     let write_stats = compute_stats(&mut write_durations);
 
     // Query phase
+    let pb = ProgressBar::new(args.queries as u64)
+        .with_prefix("Querying")
+        .with_style(style);
     let mut query_durations: Vec<Duration> = stream::iter(0..args.queries)
         .map(|_| {
             let client = client.clone();
             let url = format!("{base}/v1/namespaces/{ns}/query");
             let vector = generate_random_vector(args.dim);
             let top_k = args.top_k;
+            let pb = pb.clone();
             async move {
                 let start = Instant::now();
                 client
@@ -134,12 +149,14 @@ async fn main() {
                     .send()
                     .await
                     .unwrap();
+                pb.inc(1);
                 start.elapsed()
             }
         })
         .buffer_unordered(args.concurrency)
         .collect()
         .await;
+    pb.finish();
 
     let query_stats = compute_stats(&mut query_durations);
 
