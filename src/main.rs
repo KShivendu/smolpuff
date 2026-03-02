@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/namespaces/{ns}", delete(handlers::delete_namespace))
         .route("/v1/namespaces/{ns}/write", post(handlers::write))
         .route("/v1/namespaces/{ns}/query", post(handlers::query))
+        .route("/v1/namespaces/{ns}/index", post(handlers::build_index))
         .layer(middleware::from_fn(track_metrics))
         .layer(TraceLayer::new_for_http())
         .with_state(store);

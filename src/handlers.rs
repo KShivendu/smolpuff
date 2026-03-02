@@ -61,3 +61,11 @@ pub async fn query(
     let results = store.query_ns(&ns, &req.vector, req.top_k).await?;
     Ok(Json(QueryResponse { results }))
 }
+
+pub async fn build_index(
+    State(store): State<Arc<VectorStore>>,
+    Path(ns): Path<String>,
+) -> Result<Json<crate::models::IndexMetadata>, VectorStoreError> {
+    let meta = store.build_index(&ns).await?;
+    Ok(Json(meta))
+}
