@@ -1,5 +1,9 @@
 use crate::errors::VectorStoreError;
-use crate::models::NamespaceMetadata;
+use crate::index::builder::{build_index, decode_f32_vec, encode_f32_vec, load_existing_indices};
+use crate::index::kmeans::choose_n_probe;
+use crate::index::manager::IndexManager;
+use crate::index::posting::{PostingEntry, PostingList};
+use crate::models::{IndexMetadata, IndexStatus, NamespaceMetadata};
 use chrono::Utc;
 use metrics::{counter, histogram};
 use object_store::ObjectStore;
@@ -37,6 +41,7 @@ impl Ord for ScoredItem {
 
 pub struct VectorStore {
     db: Db,
+    index_manager: Arc<IndexManager>,
 }
 
 fn record_op(operation: &str, namespace: &str, start: Instant, succeeded: bool) {
@@ -63,7 +68,12 @@ impl VectorStore {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self, VectorStoreError> {
         let db = Db::open(path.as_ref(), object_store).await?;
-        Ok(Self { db })
+        let index_manager = Arc::new(IndexManager::new());
+
+        // Load existing indices from DB
+        load_existing_indices(&db, &index_manager).await?;
+
+        Ok(Self { db, index_manager })
     }
 
     // --- Namespace operations ---
@@ -147,6 +157,20 @@ impl VectorStore {
                 self.db.delete(&item.key).await?;
             }
 
+            // Delete index keys (centroids, posting lists, meta)
+            let idx_prefix = format!("ns:{name}:idx:");
+            let idx_end = format!("ns:{name}:idx;");
+            let mut iter = self
+                .db
+                .scan(idx_prefix.as_bytes()..idx_end.as_bytes())
+                .await?;
+            while let Ok(Some(item)) = iter.next().await {
+                self.db.delete(&item.key).await?;
+            }
+
+            // Remove from in-memory index manager
+            self.index_manager.remove_index(name).await;
+
             // Delete the metadata key
             self.db.delete(meta_key.as_bytes()).await?;
 
@@ -180,7 +204,7 @@ impl VectorStore {
 
             // Store vector as raw f32 le_bytes
             let vec_key = format!("ns:{ns}:vec:{id}");
-            let vec_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let vec_bytes = encode_f32_vec(&vector);
             self.db.put(vec_key.as_bytes(), &vec_bytes).await?;
 
             // Store attributes separately as JSON
@@ -199,11 +223,61 @@ impl VectorStore {
             let meta_bytes = serde_json::to_vec(&updated_meta)?;
             self.db.put(meta_key.as_bytes(), &meta_bytes).await?;
 
+            // Append to posting list if index exists
+            self.append_to_posting_list(ns, id, &vector).await?;
+
             Ok(())
         }
         .await;
         record_op("upsert", ns, start, result.is_ok());
         result
+    }
+
+    /// Append a vector to the nearest centroid's posting list (if an index exists).
+    async fn append_to_posting_list(
+        &self,
+        ns: &str,
+        id: &str,
+        vector: &[f32],
+    ) -> Result<(), VectorStoreError> {
+        let ns_index = match self.index_manager.get_index(ns).await {
+            Some(idx) => idx,
+            None => return Ok(()), // No index, nothing to do
+        };
+
+        // Find nearest centroid
+        let mut best_c = 0u32;
+        let mut best_sim = f32::NEG_INFINITY;
+        for c in &ns_index.centroids {
+            let sim = cosine_similarity(vector, &c.vector);
+            if sim > best_sim {
+                best_sim = sim;
+                best_c = c.id;
+            }
+        }
+
+        // Read-modify-write the posting list
+        let posting_key = format!("ns:{ns}:idx:posting:{best_c}");
+        let mut posting_list = match self.db.get(posting_key.as_bytes()).await? {
+            Some(bytes) => PostingList::deserialize(&bytes, ns_index.meta.vector_dim),
+            None => PostingList::new(),
+        };
+
+        // Remove existing entry with same ID (upsert semantics)
+        posting_list.remove_by_id(id);
+
+        // Append new entry
+        posting_list.entries.push(PostingEntry {
+            id: id.to_string(),
+            vector: vector.to_vec(),
+        });
+
+        // Write back
+        self.db
+            .put(posting_key.as_bytes(), &posting_list.serialize())
+            .await?;
+
+        Ok(())
     }
 
     pub async fn query_ns(
@@ -224,27 +298,56 @@ impl VectorStore {
                 });
             }
 
-            let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::new();
+            // Try index-accelerated query first
+            if let Some(ns_index) = self.index_manager.get_index(ns).await
+                && ns_index.meta.status == IndexStatus::Ready
+            {
+                return self
+                    .query_with_index(ns, query_vector, top_k, &ns_index)
+                    .await;
+            }
 
-            // Scan all vectors in this namespace
-            let vec_prefix = format!("ns:{ns}:vec:");
-            let vec_end = format!("ns:{ns}:vec;");
-            let mut iter = self
-                .db
-                .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
-                .await?;
+            // Fall back to brute-force
+            self.query_brute_force(ns, query_vector, top_k).await
+        }
+        .await;
+        record_op("query", ns, start, result.is_ok());
+        result
+    }
 
-            while let Ok(Some(item)) = iter.next().await {
-                // Extract id from key: "ns:{ns}:vec:{id}"
-                let key_str = String::from_utf8_lossy(&item.key);
-                let id = key_str.strip_prefix(&vec_prefix).unwrap_or("").to_string();
+    async fn query_with_index(
+        &self,
+        ns: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        ns_index: &crate::index::manager::NamespaceIndex,
+    ) -> Result<Vec<crate::models::QueryResultItem>, VectorStoreError> {
+        // 1. Find nearest centroids
+        let n_probe = choose_n_probe(ns_index.centroids.len());
+        let mut centroid_scores: Vec<(u32, f32)> = ns_index
+            .centroids
+            .iter()
+            .map(|c| (c.id, cosine_similarity(query_vector, &c.vector)))
+            .collect();
+        centroid_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                // Decode vector from le_bytes
-                let vec_data = decode_f32_vec(&item.value);
-                let score = cosine_similarity(query_vector, &vec_data);
+        // 2. Fetch posting lists for top n_probe centroids
+        let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::new();
 
-                let scored = ScoredItem { score, id };
+        for &(c_id, _) in centroid_scores.iter().take(n_probe) {
+            let posting_key = format!("ns:{ns}:idx:posting:{c_id}");
+            let posting_list = match self.db.get(posting_key.as_bytes()).await? {
+                Some(bytes) => PostingList::deserialize(&bytes, ns_index.meta.vector_dim),
+                None => continue,
+            };
 
+            // 3. Score all candidates
+            for entry in &posting_list.entries {
+                let score = cosine_similarity(query_vector, &entry.vector);
+                let scored = ScoredItem {
+                    score,
+                    id: entry.id.clone(),
+                };
                 if heap.len() < top_k {
                     heap.push(scored);
                 } else if let Some(min_item) = heap.peek()
@@ -254,35 +357,100 @@ impl VectorStore {
                     heap.push(scored);
                 }
             }
-
-            // Collect top-k IDs, sorted by score descending
-            let mut scored_ids: Vec<ScoredItem> = heap.into_iter().collect();
-            scored_ids.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            // Fetch attributes only for top-k results
-            let mut results = Vec::with_capacity(scored_ids.len());
-            for si in scored_ids {
-                let doc_key = format!("ns:{ns}:doc:{}", si.id);
-                let attributes = match self.db.get(doc_key.as_bytes()).await? {
-                    Some(val) => Some(serde_json::from_slice(&val)?),
-                    None => None,
-                };
-                results.push(crate::models::QueryResultItem {
-                    id: si.id,
-                    score: si.score,
-                    attributes,
-                });
-            }
-
-            Ok(results)
         }
-        .await;
-        record_op("query", ns, start, result.is_ok());
-        result
+
+        // 4. Collect results sorted by score descending
+        let mut scored_ids: Vec<ScoredItem> = heap.into_iter().collect();
+        scored_ids.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 5. Fetch attributes for top-k results
+        let mut results = Vec::with_capacity(scored_ids.len());
+        for si in scored_ids {
+            let doc_key = format!("ns:{ns}:doc:{}", si.id);
+            let attributes = match self.db.get(doc_key.as_bytes()).await? {
+                Some(val) => Some(serde_json::from_slice(&val)?),
+                None => None,
+            };
+            results.push(crate::models::QueryResultItem {
+                id: si.id,
+                score: si.score,
+                attributes,
+            });
+        }
+
+        Ok(results)
+    }
+
+    async fn query_brute_force(
+        &self,
+        ns: &str,
+        query_vector: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<crate::models::QueryResultItem>, VectorStoreError> {
+        let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::new();
+
+        // Scan all vectors in this namespace
+        let vec_prefix = format!("ns:{ns}:vec:");
+        let vec_end = format!("ns:{ns}:vec;");
+        let mut iter = self
+            .db
+            .scan(vec_prefix.as_bytes()..vec_end.as_bytes())
+            .await?;
+
+        while let Ok(Some(item)) = iter.next().await {
+            let key_str = String::from_utf8_lossy(&item.key);
+            let id = key_str.strip_prefix(&vec_prefix).unwrap_or("").to_string();
+
+            let vec_data = decode_f32_vec(&item.value);
+            let score = cosine_similarity(query_vector, &vec_data);
+
+            let scored = ScoredItem { score, id };
+
+            if heap.len() < top_k {
+                heap.push(scored);
+            } else if let Some(min_item) = heap.peek()
+                && score > min_item.score
+            {
+                heap.pop();
+                heap.push(scored);
+            }
+        }
+
+        // Collect top-k IDs, sorted by score descending
+        let mut scored_ids: Vec<ScoredItem> = heap.into_iter().collect();
+        scored_ids.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Fetch attributes only for top-k results
+        let mut results = Vec::with_capacity(scored_ids.len());
+        for si in scored_ids {
+            let doc_key = format!("ns:{ns}:doc:{}", si.id);
+            let attributes = match self.db.get(doc_key.as_bytes()).await? {
+                Some(val) => Some(serde_json::from_slice(&val)?),
+                None => None,
+            };
+            results.push(crate::models::QueryResultItem {
+                id: si.id,
+                score: si.score,
+                attributes,
+            });
+        }
+
+        Ok(results)
+    }
+
+    // --- Index operations ---
+
+    pub async fn build_index(&self, ns: &str) -> Result<IndexMetadata, VectorStoreError> {
+        let meta = self.get_namespace(ns).await?;
+        build_index(&self.db, &self.index_manager, ns, meta.vector_dim).await
     }
 
     // --- Backward-compatible methods for benchmarks ---
@@ -353,11 +521,4 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     dot_product / (magnitude_a * magnitude_b)
-}
-
-fn decode_f32_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
 }
