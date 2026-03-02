@@ -1,6 +1,23 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IndexStatus {
+    Building,
+    Ready,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexMetadata {
+    pub status: IndexStatus,
+    pub num_centroids: u32,
+    pub vector_dim: usize,
+    pub num_indexed_vectors: u64,
+    pub built_at: DateTime<Utc>,
+    pub version: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceMetadata {
     pub name: String,
